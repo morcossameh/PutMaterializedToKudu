@@ -143,7 +143,6 @@ public class PutMaterializedToKudu extends AbstractProcessor {
 //        this.ffbatch = context.getProperty(FLOWFILE_BATCH_SIZE).evaluateAttributeExpressions().asInteger();
         this.flushMode = FlushMode.valueOf(context.getProperty(FLUSH_MODE).getValue());
         this.getLogger().debug("Setting up Kudu connection...");
-        this.getLogger().debug(this.queriesJson);
         KerberosCredentialsService credentialsService = (KerberosCredentialsService)context.getProperty(KERBEROS_CREDENTIALS_SERVICE).asControllerService(KerberosCredentialsService.class);
         this.kuduClient = this.createClient(kuduMasters, credentialsService);
     }
@@ -215,11 +214,12 @@ public class PutMaterializedToKudu extends AbstractProcessor {
 	    	currentTableName += "::" + flowFile.getAttribute("table_name");
 	    	if(!currentTableName.equals(tableName)) {
 	    		try {
-	    			tableName = currentTableName;
 		            this.kuduTable = this.kuduClient.openTable(tableName);
+	    			tableName = currentTableName;
 		            this.getLogger().debug("Kudu connection successfully initialized");
 	    		} catch(Exception var52) {
 	    			this.getLogger().error("Failed to connect", var52);
+	        	    session.transfer(flowFile, REL_FAILURE);
 	    		}
 	    	}
 	    	KuduSession kuduSession = this.getKuduSession(this.kuduClient);
@@ -241,15 +241,15 @@ public class PutMaterializedToKudu extends AbstractProcessor {
 	    	    if (roStatus.isOverflowed()) {
 	    	    	this.getLogger().error("error buffer overflowed: some errors were discarded");
 	    	    }
-	    	    session.transfer(flowFiles.get(0), REL_FAILURE);
+	    	    session.transfer(flowFile, REL_FAILURE);
 	    	} else {
-	    		session.transfer(flowFiles.get(0), REL_SUCCESS);
+	    		session.transfer(flowFile, REL_SUCCESS);
 	    	}
 		} catch (IOException e) {
 			// TODO Auto-generated catch block
 			e.printStackTrace();
 			this.getLogger().error(e.getMessage());
-    	    session.transfer(flowFiles.get(0), REL_FAILURE);
+    	    session.transfer(flowFile, REL_FAILURE);
 		}
     }
     
