@@ -90,18 +90,22 @@ import com.jayway.jsonpath.Configuration;
 public class PutMaterializedToKudu extends AbstractProcessor {
     protected static final PropertyDescriptor KUDU_MASTERS;
     static final PropertyDescriptor KERBEROS_CREDENTIALS_SERVICE;
-    protected static final PropertyDescriptor SKIP_HEAD_LINE;
+//    protected static final PropertyDescriptor SKIP_HEAD_LINE;
     protected static final PropertyDescriptor FLUSH_MODE;
-    protected static final PropertyDescriptor FLOWFILE_BATCH_SIZE;
-    protected static final PropertyDescriptor BATCH_SIZE;
+    protected static final PropertyDescriptor QUERIES;
+    protected static final PropertyDescriptor HIVE_URL;
+//    protected static final PropertyDescriptor FLOWFILE_BATCH_SIZE;
+//    protected static final PropertyDescriptor BATCH_SIZE;
     protected static final Relationship REL_SUCCESS;
     protected static final Relationship REL_FAILURE;
-    public static final String RECORD_COUNT_ATTR = "record.count";
+//    public static final String RECORD_COUNT_ATTR = "record.count";
     protected FlushMode flushMode;
     protected int batchSize = 100;
     protected int ffbatch = 1;
     protected KuduClient kuduClient;
     protected KuduTable kuduTable;
+    protected String queriesJson;
+    protected String hiveConnectionURL;
     private volatile KerberosUser kerberosUser;
     private String tableName = null;
     private Connection conn = null;
@@ -113,11 +117,13 @@ public class PutMaterializedToKudu extends AbstractProcessor {
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
         List<PropertyDescriptor> properties = new ArrayList();
         properties.add(KUDU_MASTERS);
+        properties.add(QUERIES);
+        properties.add(HIVE_URL);
         properties.add(KERBEROS_CREDENTIALS_SERVICE);
-        properties.add(SKIP_HEAD_LINE);
+//        properties.add(SKIP_HEAD_LINE);
         properties.add(FLUSH_MODE);
-        properties.add(FLOWFILE_BATCH_SIZE);
-        properties.add(BATCH_SIZE);
+//        properties.add(FLOWFILE_BATCH_SIZE);
+//        properties.add(BATCH_SIZE);
         return properties;
     }
 
@@ -131,10 +137,13 @@ public class PutMaterializedToKudu extends AbstractProcessor {
     @OnScheduled
     public void onScheduled(ProcessContext context) throws IOException, LoginException {
         String kuduMasters = context.getProperty(KUDU_MASTERS).evaluateAttributeExpressions().getValue();
-        this.batchSize = context.getProperty(BATCH_SIZE).evaluateAttributeExpressions().asInteger();
-        this.ffbatch = context.getProperty(FLOWFILE_BATCH_SIZE).evaluateAttributeExpressions().asInteger();
+        this.queriesJson = context.getProperty(QUERIES).getValue();
+        this.hiveConnectionURL = context.getProperty(HIVE_URL).getValue();
+//        this.batchSize = context.getProperty(BATCH_SIZE).evaluateAttributeExpressions().asInteger();
+//        this.ffbatch = context.getProperty(FLOWFILE_BATCH_SIZE).evaluateAttributeExpressions().asInteger();
         this.flushMode = FlushMode.valueOf(context.getProperty(FLUSH_MODE).getValue());
         this.getLogger().debug("Setting up Kudu connection...");
+        this.getLogger().debug(this.queriesJson);
         KerberosCredentialsService credentialsService = (KerberosCredentialsService)context.getProperty(KERBEROS_CREDENTIALS_SERVICE).asControllerService(KerberosCredentialsService.class);
         this.kuduClient = this.createClient(kuduMasters, credentialsService);
     }
@@ -200,19 +209,8 @@ public class PutMaterializedToKudu extends AbstractProcessor {
 
     private void trigger(ProcessContext context, ProcessSession session, List<FlowFile> flowFiles) throws ProcessException {
     	FlowFile flowFile = flowFiles.get(0);
-    	InputStream in = session.read(flowFiles.get(0));
-      
-    	ByteSource byteSource = new ByteSource() {
-    		@Override
-    		public InputStream openStream() throws IOException {
-    			return in;
-    		}
-    	};
     	
 		try {
-			String json = byteSource.asCharSource(Charsets.UTF_8).read();
-		    Object document = Configuration.defaultConfiguration().jsonProvider().parse(json);
-		    
 	    	String currentTableName = flowFile.getAttribute("database_name");
 	    	currentTableName += "::" + flowFile.getAttribute("table_name");
 	    	if(!currentTableName.equals(tableName)) {
@@ -231,17 +229,17 @@ public class PutMaterializedToKudu extends AbstractProcessor {
 	    	kuduSession.apply(operation);
 	    	kuduSession.close();
 	    	if (kuduSession.countPendingErrors() != 0) {
-	    		this.getLogger().debug("errors inserting rows");
+	    		this.getLogger().error("errors inserting rows");
 	    	    org.apache.kudu.client.RowErrorsAndOverflowStatus roStatus = kuduSession.getPendingErrors();
 	    	    org.apache.kudu.client.RowError[] errs = roStatus.getRowErrors();
 	    	    int numErrs = errs.length;
-	    	    this.getLogger().debug("there were errors inserting rows to Kudu");
-	    	    this.getLogger().debug("the first few errors follow:");
+	    	    this.getLogger().error("there were errors inserting rows to Kudu");
+	    	    this.getLogger().error("the first few errors follow:");
 	    	    for (int i = 0; i < numErrs; i++) {
-	    	    	this.getLogger().debug(errs[i].toString());
+	    	    	this.getLogger().error(errs[i].toString());
 	    	    }
 	    	    if (roStatus.isOverflowed()) {
-	    	    	this.getLogger().debug("error buffer overflowed: some errors were discarded");
+	    	    	this.getLogger().error("error buffer overflowed: some errors were discarded");
 	    	    }
 	    	    session.transfer(flowFiles.get(0), REL_FAILURE);
 	    	} else {
@@ -255,24 +253,41 @@ public class PutMaterializedToKudu extends AbstractProcessor {
 		}
     }
     
-    private Operation getJoinRows(String primaryKey, Operation operation) {
+    private Operation getJoinRows(String primaryKey, Operation operation, FlowFile flowFile) {
     	try
-	    {	
-//    		create our mysql database connection
-//    		String myDriver = "com.mysql.jdbc.Driver";
-//    		String myUrl = "jdbc:mysql://localhost:3306/banking3";
+	    {
+	    	String currentDName = flowFile.getAttribute("database_name");
+	    	String currentTName = flowFile.getAttribute("table_name");
+    		String query = null;
+    		int queriesJsonLength = JsonPath.read(this.queriesJson, "$.length()");
+	        this.getLogger().debug("queriesJsonLength: " + queriesJsonLength);
+    		for(int i = 0; i < queriesJsonLength; i++) {
+    			String dName = JsonPath.read(this.queriesJson, "$[" + i + "].dName");
+    			if(currentDName.equals(dName)) {
+    				String tName = JsonPath.read(this.queriesJson, "$[" + i + "].tName");
+    				if(tName.equals(currentTName)) {
+    					query = JsonPath.read(this.queriesJson, "$[" + i + "].query");
+    					break;
+    				}
+    			}
+    			if(i == queriesJsonLength-1) return null;
+    		}
     		
     		Class.forName(JDBC_DRIVER_NAME);
     		
-    		String connectionUrl = "jdbc:hive2://localhost:10000/banking";
+    		String connectionUrl = this.hiveConnectionURL + "/" + currentDName;
+//    		String connectionUrl = this.hiveConnectionURL + "jdbc:hive2://localhost:10000/banking";
+    		
     		if(conn == null) {
     			conn = DriverManager.getConnection(connectionUrl, "hdfs", "");
     		}
 		  
     		// our SQL SELECT query. 
     		// if you only need a few columns, specify them by name instead of using "*"
-    		String query = "select MT_CODE, TRAN_AMOUNT, TERM_ID, CARD_ID, TRAN_SOURCE, TRAN_DEST, RECORD_DATE, card_no, a.name as custName, bSource.name as sourceName, bDest.name as destName from transactions as t inner join cards as c on t.CARD_ID = c.id inner join customers as a on c.cust_id = a.id inner join banks as bSource on bSource.id = t.TRAN_SOURCE inner join banks as bDest on bDest.id = t.TRAN_DEST where t.MT_CODE = " + primaryKey;
+//    		String query = "select MT_CODE, TRAN_AMOUNT, TERM_ID, CARD_ID, TRAN_SOURCE, TRAN_DEST, RECORD_DATE, card_no, a.name as custName, bSource.name as sourceName, bDest.name as destName from transactions as t inner join cards as c on t.CARD_ID = c.id inner join customers as a on c.cust_id = a.id inner join banks as bSource on bSource.id = t.TRAN_SOURCE inner join banks as bDest on bDest.id = t.TRAN_DEST where t.MT_CODE = " + primaryKey;
 //    		String query = "select * from transactions;";
+    		
+    		query = query.replace("|||", primaryKey);
     		
     		// create the java statement
     		Statement st = conn.createStatement();
@@ -341,12 +356,12 @@ public class PutMaterializedToKudu extends AbstractProcessor {
     	int keyColumnType = Integer.parseInt(flowFile.getAttribute("key_column_type"));
     	if(type.equals("insert")) {
     		operation = kuduTable.newInsert();
-    		return getJoinRows(keyValue, operation);
+    		return getJoinRows(keyValue, operation, flowFile);
     	} else if(type.equals("delete")) {
     		operation = kuduTable.newDelete();
     	} else if(type.equals("update")) {
     		operation = kuduTable.newUpdate();
-    		return getJoinRows(keyValue, operation);
+    		return getJoinRows(keyValue, operation, flowFile);
     	}
     	PartialRow row = operation.getRow();
     	
@@ -476,10 +491,12 @@ public class PutMaterializedToKudu extends AbstractProcessor {
     static {
         KUDU_MASTERS = (new Builder()).name("Kudu Masters").description("List all kudu masters's ip with port (e.g. 7051), comma separated").required(true).addValidator(StandardValidators.NON_EMPTY_VALIDATOR).expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY).build();
         KERBEROS_CREDENTIALS_SERVICE = (new Builder()).name("kerberos-credentials-service").displayName("Kerberos Credentials Service").description("Specifies the Kerberos Credentials to use for authentication").required(false).identifiesControllerService(KerberosCredentialsService.class).build();
-        SKIP_HEAD_LINE = (new Builder()).name("Skip head line").description("Deprecated. Used to ignore header lines, but this should be handled by a RecordReader (e.g. \"Treat First Line as Header\" property of CSVReader)").allowableValues(new String[]{"true", "false"}).defaultValue("false").required(true).addValidator(StandardValidators.NON_EMPTY_VALIDATOR).build();
+//        SKIP_HEAD_LINE = (new Builder()).name("Skip head line").description("Deprecated. Used to ignore header lines, but this should be handled by a RecordReader (e.g. \"Treat First Line as Header\" property of CSVReader)").allowableValues(new String[]{"true", "false"}).defaultValue("false").required(true).addValidator(StandardValidators.NON_EMPTY_VALIDATOR).build();
         FLUSH_MODE = (new Builder()).name("Flush Mode").description("Set the new flush mode for a kudu session.\nAUTO_FLUSH_SYNC: the call returns when the operation is persisted, else it throws an exception.\nAUTO_FLUSH_BACKGROUND: the call returns when the operation has been added to the buffer. This call should normally perform only fast in-memory operations but it may have to wait when the buffer is full and there's another buffer being flushed.\nMANUAL_FLUSH: the call returns when the operation has been added to the buffer, else it throws a KuduException if the buffer is full.").allowableValues(FlushMode.values()).defaultValue(FlushMode.AUTO_FLUSH_BACKGROUND.toString()).required(true).build();
-        FLOWFILE_BATCH_SIZE = (new Builder()).name("FlowFiles per Batch").description("The maximum number of FlowFiles to process in a single execution, between 1 - 100000. Depending on your memory size, and data size per row set an appropriate batch size for the number of FlowFiles to process per client connection setup.Gradually increase this number, only if your FlowFiles typically contain a few records.").defaultValue("1").required(true).addValidator(StandardValidators.createLongValidator(1L, 100000L, true)).expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY).build();
-        BATCH_SIZE = (new Builder()).name("Batch Size").displayName("Max Records per Batch").description("The maximum number of Records to process in a single Kudu-client batch, between 1 - 100000. Depending on your memory size, and data size per row set an appropriate batch size. Gradually increase this number to find out the best one for best performances.").defaultValue("100").required(true).addValidator(StandardValidators.createLongValidator(1L, 100000L, true)).expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY).build();
+//        FLOWFILE_BATCH_SIZE = (new Builder()).name("FlowFiles per Batch").description("The maximum number of FlowFiles to process in a single execution, between 1 - 100000. Depending on your memory size, and data size per row set an appropriate batch size for the number of FlowFiles to process per client connection setup.Gradually increase this number, only if your FlowFiles typically contain a few records.").defaultValue("1").required(true).addValidator(StandardValidators.createLongValidator(1L, 100000L, true)).expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY).build();
+//        BATCH_SIZE = (new Builder()).name("Batch Size").displayName("Max Records per Batch").description("The maximum number of Records to process in a single Kudu-client batch, between 1 - 100000. Depending on your memory size, and data size per row set an appropriate batch size. Gradually increase this number to find out the best one for best performances.").defaultValue("100").required(true).addValidator(StandardValidators.createLongValidator(1L, 100000L, true)).expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY).build();
+        QUERIES = (new Builder()).name("Queries").displayName("Queries from hive").description("").addValidator(StandardValidators.NON_EMPTY_VALIDATOR).build();
+        HIVE_URL = (new Builder()).name("Hive Connection URL").displayName("Hive Connection URL").description("").addValidator(StandardValidators.NON_EMPTY_VALIDATOR).required(true).build();
         REL_SUCCESS = (new org.apache.nifi.processor.Relationship.Builder()).name("success").description("A FlowFile is routed to this relationship after it has been successfully stored in Kudu").build();
         REL_FAILURE = (new org.apache.nifi.processor.Relationship.Builder()).name("failure").description("A FlowFile is routed to this relationship if it cannot be sent to Kudu").build();
     }
